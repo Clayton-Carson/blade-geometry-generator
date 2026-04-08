@@ -36,9 +36,9 @@ root_cutout:
 
 # Airfoil files: name -> CSV path (relative to this config)
 airfoils:
-  RC310: airfoil_RC310.csv
-  RC410: airfoil_RC410.csv
-  ROOT_CUTOUT: airfoil_ROOT_CUTOUT.csv
+  RC310: airfoils/airfoil_RC310.csv
+  RC410: airfoils/airfoil_RC410.csv
+  ROOT_CUTOUT: airfoils/airfoil_ROOT_CUTOUT.csv
 
 # Station definitions
 # Each station: r/R, airfoil name, and optional overrides

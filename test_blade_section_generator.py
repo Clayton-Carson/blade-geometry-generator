@@ -357,7 +357,7 @@ class TestWithRealAirfoil:
 
     @pytest.fixture
     def rc310_path(self):
-        path = Path(__file__).parent / "airfoil_RC310.csv"
+        path = Path(__file__).parent / "airfoils" / "airfoil_RC310.csv"
         if not path.exists():
             pytest.skip("airfoil_RC310.csv not found")
         return str(path)
