@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python blade_section_generator.py blade_config.yaml)",
+      "Bash(wc -l output/curves/base_S*.txt)",
+      "Bash(wc -l output/curves/cap_S*.txt)",
+      "Bash(python solidworks_import.py --dry-run)"
+    ]
+  }
+}

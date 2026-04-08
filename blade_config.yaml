@@ -1,0 +1,55 @@
+# ============================================================
+# S-64 Tail Rotor Blade Section Generator — Configuration
+# Units: inches, degrees
+# Coordinate system: X chordwise, Y thickness, Z spanwise
+# ============================================================
+
+global_geometry:
+  span: 39.37007874015748        # 1000 mm
+  root_chord: 4.724409448818897   # 120 mm
+  tip_chord: 3.149606299212599    # 80 mm
+  ref_axis_xc: 0.25              # quarter-chord
+
+  taper_start_z: 0.0             # taper begins at root
+  sweep_start_z: 0.0
+  sweep_angle_deg: 0.0
+
+  twist_start_z: 0.0             # twist begins at root
+  twist_rate_deg_per_bs: -10.0   # deg per blade station (r/R)
+
+trailing_edge:
+  min_thickness: 0.05            # global min TE thickness (in), 0 to disable
+
+nickel_cap:
+  cap_te_xc: 0.225               # cap trailing edge in x/c
+  offset_at_le: 0.05             # max offset at LE (in)
+  offset_at_cap_te: 0.011        # offset at cap TE (in)
+  exponent: 3.3333333333         # power-law decay exponent (10/3)
+  planform_offset_sign: 1        # +1 aft/inward, -1 forward/outward
+  normal_offset_sign: -1         # +1 outward, -1 inward
+
+root_cutout:
+  chord_basis: 24.0
+  thickness: 4.0
+  te_radius: 1.0
+  n_points: 101
+
+# Airfoil files: name -> CSV path (relative to this config)
+airfoils:
+  RC310: airfoil_RC310.csv
+  RC410: airfoil_RC410.csv
+  ROOT_CUTOUT: airfoil_ROOT_CUTOUT.csv
+
+# Station definitions
+# Each station: r/R, airfoil name, and optional overrides
+stations:
+  - { rR: 0.000000000000000, airfoil: RC310 }
+  - { rR: 0.142857142857143, airfoil: RC310 }
+  - { rR: 0.285714285714286, airfoil: RC310 }
+  - { rR: 0.428571428571429, airfoil: RC310 }
+  - { rR: 0.571428571428571, airfoil: RC310 }
+  - { rR: 0.714285714285714, airfoil: RC310 }
+  - { rR: 0.857142857142857, airfoil: RC310 }
+  - { rR: 1.000000000000000, airfoil: RC310 }
+  # Optional overrides per station:
+  # - { rR: 0.5, airfoil: RC410, chord: 4.0, twist_deg: -3.0, sweep_x: 0.1, te_thickness: 0.06 }
