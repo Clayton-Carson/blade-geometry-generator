@@ -1,0 +1,6 @@
+# Force LF line endings on all text files regardless of the target
+# platform's core.autocrlf setting. Critical for .sh hook scripts —
+# bash chokes on CRLF shebangs, and on Windows autocrlf=true would
+# otherwise rewrite them on every checkout and silently disable the
+# hooks. Copy this file into the target repo alongside CLAUDE.md.
+* text=auto eol=lf
