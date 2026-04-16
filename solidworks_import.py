@@ -108,23 +108,62 @@ def discover_curve_files(curves_dir, prefix, n_stations=NUM_STATIONS):
 
 # ─── SolidWorks COM helpers ─────────────────────────────────
 
+# sldworks.tlb GUID — stable across SW versions; the major version follows SW:
+# SW 2021 = 29, SW 2022 = 30, etc.
+SLDWORKS_TLB_GUID = "{83A33D31-27C5-11CE-BFD4-00400513BB57}"
+
+
+# DISPIDs and arg-type signatures extracted from the generated
+# win32com.gen_py wrapper for sldworks.tlb. We can't use the generated class
+# wrappers directly because SW objects don't respond to QueryInterface for
+# their declared interfaces, so the wrapper's _oleobj_ ends up being the raw
+# CDispatch without the correct DISPID routing. Calling InvokeTypes directly
+# on the underlying PyIDispatch (._oleobj_) sidesteps that entirely.
+#
+# Each tuple: (dispid, lcid, wFlags, return_type_tuple, arg_types_tuple)
+_DISPID_InsertNetBlend2 = (
+    251, 0, 1, (9, 0),
+    ((2, 1), (2, 1), (2, 1), (11, 1), (5, 1), (11, 1), (11, 1), (11, 1),
+     (11, 1), (11, 1), (5, 1), (5, 1), (11, 1), (2, 1), (11, 1), (11, 1),
+     (5, 1), (11, 1), (5, 1), (11, 1), (11, 1)),
+)
+# IModelDoc2.InsertLoftRefSurface2 — lofted surface from current selection
+# (profiles mark=1, guides mark=2). Returns VT_VOID in the typelib.
+_DISPID_InsertLoftRefSurface2 = (
+    65882, 0, 1, (24, 0),
+    ((11, 1), (11, 1), (11, 1), (5, 1), (2, 1), (2, 1)),
+)
+# IModelDocExtension.SelectByID2 — authoritative name-based selection.
+_DISPID_SelectByID2 = (
+    68, 0, 1, (11, 0),
+    ((8, 1), (8, 1), (5, 1), (5, 1), (5, 1), (11, 1), (3, 1), (9, 1), (3, 1)),
+)
+_DISPID_SaveAs3 = (
+    66222, 0, 1, (3, 0),
+    ((8, 1), (3, 1), (3, 1)),
+)
+
+
+def _invoke(obj, dispid_spec, *args):
+    """Call a method by DISPID on the raw PyIDispatch underlying obj."""
+    dispid, lcid, flags, rettype, argtypes = dispid_spec
+    return obj._oleobj_.InvokeTypes(dispid, lcid, flags, rettype, argtypes, *args)
+
+
 def connect_solidworks():
-    """Connect to running SolidWorks. Returns (sw, model_getter) where
-    model_getter() always returns a fresh reference to the active document."""
+    """Connect to running SolidWorks, or launch a new instance."""
     import win32com.client
     import pythoncom
+
     pythoncom.CoInitialize()
 
     sw = None
-
-    # Try attaching to a running instance first
     try:
         sw = win32com.client.GetObject(Class="SldWorks.Application")
         log.info("Attached to running SolidWorks instance")
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"GetObject attach failed: {e}")
 
-    # Launch new instance
     if sw is None:
         for progid in ["SldWorks.Application", "SldWorks.Application.29"]:
             try:
@@ -136,9 +175,7 @@ def connect_solidworks():
 
     if sw is None:
         raise RuntimeError(
-            "Cannot connect to SolidWorks. Ensure it is installed and licensed.\n"
-            "Tried: GetObject, Dispatch('SldWorks.Application'), "
-            "Dispatch('SldWorks.Application.29')"
+            "Cannot connect to SolidWorks. Ensure it is installed and licensed."
         )
 
     sw.Visible = True
@@ -198,71 +235,117 @@ def create_part(sw):
     return model
 
 
+def _reset_sketch_counter():
+    """No-op retained for backwards compatibility — current flow no longer
+    needs a counter since it grabs the just-created feature directly."""
+    pass
+
+
+def _newest_feature(model):
+    """Return the most recently added feature via FeatureManager.GetFeatures.
+
+    We can't use model.FirstFeature/GetNextFeature in late-bound dispatch
+    ("Member not found"), and selection-based approaches are unreliable after
+    closing a 3D sketch. FeatureManager.GetFeatures(False) returns the full
+    feature list in tree order, so the last entry is the newest.
+    """
+    try:
+        features = model.FeatureManager.GetFeatures(False)
+    except Exception as e:
+        log.warning(f"  GetFeatures failed: {e}")
+        return None
+    if features is None:
+        return None
+    try:
+        n = len(features)
+    except Exception:
+        return None
+    if n == 0:
+        return None
+    return features[n - 1]
+
+
+def _feature_count(model):
+    """Return the current feature-tree count, or 0 if it can't be read."""
+    try:
+        features = model.FeatureManager.GetFeatures(False)
+        return len(features) if features is not None else 0
+    except Exception:
+        return 0
+
+
 def create_3d_spline(sw, points_inches, sketch_name=None):
     """
     Create a 3D sketch containing a spline through the given points.
     points_inches: (N, 3) numpy array in inches.
     API expects meters, so we convert here.
 
-    Returns the sketch_name used.
+    Returns the Feature IDispatch handle for the newly-created sketch.
+    Downstream code should hold this handle and call feat.Select2(append, mark)
+    directly — by-name lookup (FeatureByName / SelectByID2) is unreliable
+    across many sketches in late-bound dispatch.
     """
     import win32com.client
     import pythoncom
 
     model = sw.ActiveDoc
+    sketch_mgr = model.SketchManager
 
-    # Open a new 3D sketch
-    model.Insert3DSketch2(True)
+    # Clear selection BEFORE opening. If the previously-closed sketch is still
+    # selected, Insert3DSketch re-enters edit on that sketch (combining two
+    # profiles into one). Clearing ensures a brand-new sketch.
+    model.ClearSelection2(True)
+    sketch_mgr.Insert3DSketch(True)  # open
 
-    # Convert inches to meters and flatten
     pts_m = (points_inches * INCHES_TO_METERS).flatten().tolist()
-
-    # Build VARIANT SAFEARRAY of doubles
     pt_array = win32com.client.VARIANT(
         pythoncom.VT_ARRAY | pythoncom.VT_R8, pts_m
     )
-
-    # CreateSpline2 creates a spline through the given points
-    sketch_mgr = model.SketchManager
     spline = sketch_mgr.CreateSpline2(pt_array, False)
-
     if spline is None:
-        log.warning(f"CreateSpline2 returned None for {len(points_inches)} points")
+        log.debug(f"  CreateSpline2 returned None for {len(points_inches)} points")
 
-    # Close the 3D sketch
-    model.Insert3DSketch2(True)
+    sketch_mgr.Insert3DSketch(True)  # close
 
-    # Rename the sketch if requested — get it via selection
+    feat = _newest_feature(model)
+    if feat is None:
+        log.warning(f"  Could not locate newly-created sketch (rename to {sketch_name} skipped)")
+        return None
+
     if sketch_name:
         try:
-            # After closing a 3D sketch, it's typically still selected
-            sel_mgr = model.SelectionManager
-            count = sel_mgr.GetSelectedObjectCount2(-1)
-            if count > 0:
-                feat = sel_mgr.GetSelectedObject6(1, -1)
-                if feat is not None:
-                    feat.Name = sketch_name
-                    log.debug(f"  Renamed sketch to {sketch_name}")
+            feat.Name = sketch_name
+            log.debug(f"  Named sketch {sketch_name!r}")
         except Exception as e:
-            log.debug(f"  Could not rename sketch: {e}")
+            log.warning(f"  Could not rename sketch to {sketch_name!r}: {e}")
 
-    return sketch_name
+    return feat
 
 
-def select_by_name(sw, feat_name, feat_type="SKETCH", mark=0, append=True):
-    """Select a feature by name using SelectByID2 (reliable with late-bound COM)."""
-    model = sw.ActiveDoc
+def select_by_name(model, name, feat_type="SKETCH", mark=0, append=True):
+    """Select a feature by name via IModelDocExtension.SelectByID2 (DISPID 68).
+
+    Early-bound name-based selection is more reliable than Feature.Select2 on
+    a captured handle — captured Feature IDispatches go stale once more
+    features are added to the tree (Select2 returns True but the selection
+    doesn't actually register, as seen in SelectionManager readback).
+    """
+    if not name:
+        log.warning("  Cannot select: empty name")
+        return False
     try:
-        result = model.Extension.SelectByID2(
-            feat_name, feat_type, 0, 0, 0, append, mark, None, 0
+        ok = _invoke(
+            model.Extension, _DISPID_SelectByID2,
+            name, feat_type, 0.0, 0.0, 0.0,
+            bool(append), int(mark), None, 0,
         )
-        if result:
-            log.debug(f"  Selected '{feat_name}' (mark={mark})")
+        if ok:
+            log.debug(f"  Selected {name!r} (mark={mark})")
         else:
-            log.warning(f"  SelectByID2 failed for '{feat_name}'")
-        return result
+            log.warning(f"  SelectByID2 returned False for {name!r}")
+        return ok
     except Exception as e:
-        log.warning(f"  SelectByID2 error for '{feat_name}': {e}")
+        log.warning(f"  SelectByID2 exception for {name!r}: {e}")
         return False
 
 
@@ -271,7 +354,7 @@ def select_by_name(sw, feat_name, feat_type="SKETCH", mark=0, append=True):
 def import_curves(sw, curves_dir, body_type):
     """
     Import cross-section curves as 3D sketch splines.
-    Returns list of (station_id, sketch_name) tuples.
+    Returns list of (station_id, label, feature_handle) tuples.
     """
     prefix = body_type
     files = discover_curve_files(curves_dir, prefix)
@@ -280,17 +363,17 @@ def import_curves(sw, curves_dir, body_type):
     log.info(f"Importing {len(files)} {body_type} curves as 3D sketch splines...")
     for i, fpath in enumerate(files):
         stn_id = i + 1
-        name = f"{body_type}_S{stn_id:02d}"
+        name = f"{body_type}_section_{stn_id:02d}"
         log.info(f"  Importing {fpath.name} -> {name}...")
 
         pts = read_curve_points(fpath)
         if len(pts) == 0:
             log.error(f"  No points in {fpath.name}")
-            sketches.append((stn_id, None))
+            sketches.append((stn_id, name, None))
             continue
 
-        create_3d_spline(sw, pts, sketch_name=name)
-        sketches.append((stn_id, name))
+        feat = create_3d_spline(sw, pts, sketch_name=name)
+        sketches.append((stn_id, name, feat))
         log.info(f"  Created {name} ({len(pts)} points)")
 
     return sketches
@@ -337,7 +420,7 @@ def build_guide_points(curves_dir, body_type):
 def create_guide_curves(sw, curves_dir, body_type):
     """
     Create all guide curves as 3D sketch splines.
-    Returns list of (guide_name, sketch_name) tuples.
+    Returns list of (guide_name, label, feature_handle) tuples.
     """
     guide_pts = build_guide_points(curves_dir, body_type)
     sketches = []
@@ -346,8 +429,8 @@ def create_guide_curves(sw, curves_dir, body_type):
     for name, pts in guide_pts.items():
         sketch_name = f"{body_type}_guide_{name}"
         log.info(f"  Creating {sketch_name} ({len(pts)} points)...")
-        create_3d_spline(sw, pts, sketch_name=sketch_name)
-        sketches.append((name, sketch_name))
+        feat = create_3d_spline(sw, pts, sketch_name=sketch_name)
+        sketches.append((name, sketch_name, feat))
 
     return sketches
 
@@ -357,85 +440,80 @@ def create_guide_curves(sw, curves_dir, body_type):
 def create_surface(sw, profile_sketches, guide_sketches, body_type):
     """
     Create a boundary surface (or loft fallback) from profiles and guides.
-    profile_sketches: list of (stn_id, sketch_name) from import_curves
-    guide_sketches: list of (name, sketch_name) from create_guide_curves
+    profile_sketches: list of (stn_id, label, feature_handle) from import_curves
+    guide_sketches: list of (name, label, feature_handle) from create_guide_curves
     """
     model = sw.ActiveDoc
     log.info(f"Creating {body_type} surface...")
 
-    # Clear any existing selection
+    # Capture feature count BEFORE touching selection. GetFeatures between
+    # Select2 calls and the loft invocation can disturb selection state.
+    before = _feature_count(model)
+
     model.ClearSelection2(True)
 
-    # Select profiles with mark = 1
     profile_count = 0
-    for stn_id, sketch_name in profile_sketches:
-        if sketch_name is None:
-            log.warning(f"  Skipping missing profile S{stn_id:02d}")
+    for stn_id, label, feat in profile_sketches:
+        if not label:
+            log.warning(f"  Skipping profile S{stn_id:02d} with no name")
             continue
-        if select_by_name(sw, sketch_name, "SKETCH", MARK_PROFILE, append=(profile_count > 0)):
+        if select_by_name(model, label, "SKETCH", mark=MARK_PROFILE, append=(profile_count > 0)):
             profile_count += 1
 
-    # Select guides with mark = 2
     guide_count = 0
-    for name, sketch_name in guide_sketches:
-        if sketch_name is None:
+    for _name, label, feat in guide_sketches:
+        if not label:
             continue
-        if select_by_name(sw, sketch_name, "SKETCH", MARK_GUIDE, append=True):
+        if select_by_name(model, label, "SKETCH", mark=MARK_GUIDE, append=True):
             guide_count += 1
 
     log.info(f"  Selected {profile_count} profiles, {guide_count} guides")
+
+    # Diagnostic: read back the SelectionManager to verify marks are set
+    try:
+        sel_mgr = model.SelectionManager
+        sel_count = sel_mgr.GetSelectedObjectCount2(-1)
+        mark_hist = {}
+        for i in range(1, sel_count + 1):
+            m = sel_mgr.GetSelectedObjectMark(i)
+            mark_hist[m] = mark_hist.get(m, 0) + 1
+        log.info(f"  Selection readback: {sel_count} items; marks = {mark_hist}")
+    except Exception as e:
+        log.warning(f"  Selection readback failed: {e}")
 
     if profile_count < 2:
         log.error("  Need at least 2 profiles for surface creation")
         return None
 
-    feat_mgr = model.FeatureManager
-    surface_feat = None
-
-    # Try boundary surface
+    # IModelDoc2.InsertLoftRefSurface2 lofts a surface through the selected
+    # profiles (mark=1) using the selected guide curves (mark=2). The typelib
+    # says it returns VT_VOID, so we verify success by counting features
+    # before/after — if a new feature appeared, the loft worked.
     try:
-        log.info("  Attempting boundary surface...")
-        surface_feat = feat_mgr.InsertBoundarySurface(False, False)
+        _invoke(
+            model, _DISPID_InsertLoftRefSurface2,
+            False,  # Closed
+            False,  # KeepTangency
+            False,  # ForceNonRational
+            1.0,    # TessToleranceFactor
+            0,      # StartMatchingType (0 = Default/None)
+            0,      # EndMatchingType
+        )
     except Exception as e:
-        log.warning(f"  Boundary surface failed: {e}")
+        log.error(f"  InsertLoftRefSurface2 raised: {e}")
+        return None
 
-    # Fallback: loft with guides
-    if surface_feat is None:
-        log.info("  Falling back to loft surface...")
-        model.ClearSelection2(True)
-        for stn_id, sketch_name in profile_sketches:
-            if sketch_name is not None:
-                select_by_name(sw, sketch_name, "SKETCH", MARK_PROFILE, append=True)
-        try:
-            surface_feat = feat_mgr.InsertProtrusionBlend2(
-                False, True, False, 1.0, 0, 0, 1, True, 0,
-                0.0, 0.0, False, 0.0, 0.0, 0, True, True, 0, 0,
-            )
-        except Exception as e:
-            log.warning(f"  Loft also failed: {e}")
+    after = _feature_count(model)
+    if after <= before:
+        log.error(
+            f"  Loft surface not created (feature count {before} -> {after}). "
+            "Check for sketch errors or intersection issues. Sketches and "
+            "selections are in place — try Insert > Surface > Loft manually."
+        )
+        return None
 
-    # Final fallback: simple loft
-    if surface_feat is None:
-        log.info("  Attempting simple loft (no guides)...")
-        model.ClearSelection2(True)
-        for stn_id, sketch_name in profile_sketches:
-            if sketch_name is not None:
-                select_by_name(sw, sketch_name, "SKETCH", MARK_PROFILE, append=True)
-        try:
-            surface_feat = model.InsertLoftSurface2(
-                False, False, False, True, 0, 0, 0.0, 0.0, False, 0.0, 0.0, 0
-            )
-        except Exception as e:
-            log.error(f"  All surface creation methods failed: {e}")
-            log.error(
-                "  You can create the surface manually: select the imported "
-                "curves in order, then Insert > Surface > Boundary Surface."
-            )
-            return None
-
-    if surface_feat is not None:
-        log.info(f"  Created {body_type} surface successfully")
-
+    surface_feat = _newest_feature(model)
+    log.info(f"  Created {body_type} surface (feature count {before} -> {after})")
     return surface_feat
 
 
@@ -482,6 +560,7 @@ def run(args):
     # ── Connect to SolidWorks ──
     sw = connect_solidworks()
     model = create_part(sw)
+    _reset_sketch_counter()
 
     # Storage for sketches per body type
     all_profiles = {}
@@ -516,17 +595,26 @@ def run(args):
 
     if args.save:
         save_path = str(Path(args.save).resolve())
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        try:
+            model.ClearSelection2(True)
+        except Exception:
+            pass
+        # Remove any existing file so SW doesn't show an overwrite dialog
+        try:
+            Path(save_path).unlink(missing_ok=True)
+        except Exception:
+            pass
         log.info(f"Saving to {save_path}...")
         try:
-            errors = model.Extension.SaveAs3(
-                save_path, 0, 0, None, None, None
-            )
-            if errors == 0:
+            # Options=4 = swSaveAsOptions_Silent (suppress dialogs)
+            result = _invoke(model, _DISPID_SaveAs3, save_path, 0, 4)
+            if result == 0:
                 log.info("Saved successfully")
             else:
-                log.warning(f"Save returned error code: {errors}")
+                log.warning(f"SaveAs3 returned error code {result}")
         except Exception as e:
-            log.warning(f"Save failed: {e}")
+            log.warning(f"SaveAs3 failed: {e}")
 
     log.info("\nDone.")
 
